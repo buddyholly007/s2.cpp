@@ -4,6 +4,7 @@
 #include <iostream>
 #include <string>
 #include <cstring>
+#include <cstdlib>
 
 int main(int argc, char** argv) {
     // --- Paramètres par défaut ---
@@ -11,7 +12,7 @@ int main(int argc, char** argv) {
     params.model_path = "model.gguf";
     params.tokenizer_path = "tokenizer.json";
     params.vulkan_device = 0;
-    params.codec_vulkan_device = 0;
+    params.codec_vulkan_device = -2;  // -2 = unset, inherit from model; -1 = force CPU
     params.gen.n_threads = 4;
     params.gen.max_new_tokens = 1024;
     params.gen.temperature = 0.7f;
@@ -76,6 +77,22 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // The Fish Audio Peter Parker checkpoint mangles the first 1-2 syllables of
+    // every prompt — verified on both the cloud API and this local s2.cpp build.
+    // Other interjections like "Okay, " or "Hey, " get substituted into a second
+    // "Hey" by the Peter character bias; "Listen, " is phonetically distant
+    // enough that the model absorbs it as a slight unintelligible artifact and
+    // the caller's actual first word survives intact. Configurable via the
+    // S2_LEADING_PREFIX env var; set it to "" to disable entirely.
+    const char * env_prefix = std::getenv("S2_LEADING_PREFIX");
+    const std::string leading_prefix = env_prefix ? std::string(env_prefix) : std::string("Listen, ");
+    if (!leading_prefix.empty()) {
+        std::cout << "Leading prefix: \"" << leading_prefix
+                  << "\" (set S2_LEADING_PREFIX=\"\" to disable)" << std::endl;
+    } else {
+        std::cout << "Leading prefix: disabled" << std::endl;
+    }
+
     // --- Serveur HTTP ---
     crow::SimpleApp app;
 
@@ -93,6 +110,15 @@ int main(int argc, char** argv) {
             synth_params.text = json["input"].s();
         } else {
             return crow::response(400, "Missing 'text' field");
+        }
+
+        // Workaround for the leading-word drop quirk of the Peter Parker checkpoint:
+        // prepend a throwaway interjection that the model will discard, so the
+        // caller's actual first word survives. Skip if the caller already starts
+        // with the same prefix to avoid double-prepending.
+        if (!leading_prefix.empty() && !synth_params.text.empty() &&
+            synth_params.text.compare(0, leading_prefix.size(), leading_prefix) != 0) {
+            synth_params.text = leading_prefix + synth_params.text;
         }
 
         // Paramètres de génération (format s2.cpp natif)

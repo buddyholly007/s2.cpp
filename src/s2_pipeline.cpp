@@ -18,11 +18,11 @@ Pipeline::~Pipeline() {
 bool Pipeline::init(const PipelineParams & params) {
     std::cout << "--- Pipeline Init ---" << std::endl;
 
-    // Déterminer les GPU
+    // Determine GPU devices (-1 = CPU, -2 = unset/follow model)
     int model_gpu = params.vulkan_device;
     int codec_gpu = params.codec_vulkan_device;
-    // Si codec_vulkan_device non spécifié, utiliser le même GPU que le modèle
-    if (codec_gpu < 0) codec_gpu = model_gpu;
+    // Only inherit model GPU if codec device was truly unset (use -2 for unset)
+    if (codec_gpu == -2) codec_gpu = model_gpu;
 
     std::cout << "GPU assignment: model -> GPU " << model_gpu
               << ", codec -> GPU " << codec_gpu << std::endl;
@@ -50,24 +50,23 @@ bool Pipeline::init(const PipelineParams & params) {
     
     std::cout << "Loading codec from: " << codec_path << std::endl;
 
-    // Charger le codec sur le GPU assigné, avec fallback
-    std::cout << "Loading codec on GPU " << codec_gpu << "..." << std::endl;
+    // Load codec — use CPU directly when codec_gpu < 0, or try GPU then CPU
+    std::cout << "Loading codec (device=" << codec_gpu << ")..." << std::endl;
     bool codec_loaded = false;
 
     if (codec_gpu >= 0) {
         std::cout << "Trying codec on GPU " << codec_gpu << "..." << std::endl;
         if (codec_.load(codec_path, codec_gpu)) {
-            std::cout << "Codec loaded on GPU " << codec_gpu << " (dedicated)." << std::endl;
+            std::cout << "Codec loaded on GPU " << codec_gpu << "." << std::endl;
             codec_loaded = true;
         } else {
-            std::cout << "Codec failed on GPU " << codec_gpu << std::endl;
+            std::cout << "Codec GPU failed, loading on CPU..." << std::endl;
         }
     }
 
     if (!codec_loaded) {
-        std::cout << "Pipeline warning: codec failed on GPU, falling back to CPU." << std::endl;
         if (codec_.load(codec_path, -1)) {
-            std::cout << "Codec loaded on CPU (fallback)." << std::endl;
+            std::cout << "Codec loaded on CPU." << std::endl;
             codec_loaded = true;
         }
     }
