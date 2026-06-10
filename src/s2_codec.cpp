@@ -702,19 +702,29 @@ AudioCodec::~AudioCodec() {
 
 bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
     if (vulkan_device >= 0) {
-#ifdef GGML_USE_CUDA
-        impl_->backend = ggml_backend_cuda_init(static_cast<size_t>(vulkan_device));
-        if (!impl_->backend) {
-            std::cerr << "[Codec] CUDA init failed, falling back to CPU." << std::endl;
-        } else {
-            std::cerr << "[Codec] Using CUDA backend." << std::endl;
-        }
-#elif defined(GGML_USE_VULKAN)
+        // Vulkan FIRST for the codec (the flag is --codec-vulkan): the CUDA
+        // codec path is broken upstream — IM2COL invalid-argument abort in
+        // decode + oversized encode buffers (measured 2026-06-10). CUDA is
+        // kept only as a fallback when Vulkan isn't compiled/available.
+#ifdef GGML_USE_VULKAN
         impl_->backend = ggml_backend_vk_init(static_cast<size_t>(vulkan_device));
-        if (!impl_->backend) {
-            std::cerr << "[Codec] Vulkan init failed, falling back to CPU." << std::endl;
+        if (impl_->backend) {
+            std::cerr << "[Codec] Using Vulkan backend." << std::endl;
+        } else {
+            std::cerr << "[Codec] Vulkan init failed." << std::endl;
         }
 #endif
+#ifdef GGML_USE_CUDA
+        if (!impl_->backend) {
+            impl_->backend = ggml_backend_cuda_init(static_cast<size_t>(vulkan_device));
+            if (impl_->backend) {
+                std::cerr << "[Codec] Using CUDA backend (Vulkan unavailable)." << std::endl;
+            }
+        }
+#endif
+        if (!impl_->backend) {
+            std::cerr << "[Codec] GPU init failed, falling back to CPU." << std::endl;
+        }
     }
     if (!impl_->backend) impl_->backend = ggml_backend_cpu_init();
     if (!impl_->backend) { std::cerr << "[Codec] No backend." << std::endl; return false; }

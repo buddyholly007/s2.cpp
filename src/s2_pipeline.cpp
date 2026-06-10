@@ -59,6 +59,7 @@ bool Pipeline::init(const PipelineParams & params) {
         if (codec_.load(codec_path, codec_gpu)) {
             std::cout << "Codec loaded on GPU " << codec_gpu << "." << std::endl;
             codec_loaded = true;
+            codec_on_gpu_ = true;  // actual outcome, not requested config
         } else {
             std::cout << "Codec GPU failed, loading on CPU..." << std::endl;
         }
@@ -87,6 +88,18 @@ bool Pipeline::init(const PipelineParams & params) {
         if (hp.vocab_size        > 0) tc.vocab_size        = hp.vocab_size;
     }
 
+    // Init-time encodes (reference + silence) run on a TEMPORARY CPU codec
+    // when the serving codec is on GPU: encode's compute buffer is ~590MB
+    // for the 7s reference (measured 2026-06-10) and would otherwise stay
+    // resident on a card that doesn't have it to spare. The temp instance
+    // frees when init() returns; decode stays on the GPU codec.
+    AudioCodec init_cpu_codec;
+    AudioCodec * init_encoder = &codec_;
+    if (codec_on_gpu_ && init_cpu_codec.load(codec_path, -1)) {
+        init_encoder = &init_cpu_codec;
+        std::cout << "[init] Using temporary CPU codec for init-time encodes." << std::endl;
+    }
+
     // --- Charger la référence audio une seule fois au démarrage ---
     if (std::FILE* file = std::fopen("reference.wav", "rb")) {
         std::fclose(file);
@@ -94,7 +107,7 @@ bool Pipeline::init(const PipelineParams & params) {
         if (load_audio("reference.wav", ref_audio, codec_.sample_rate())) {
             std::vector<int32_t> ref_codes;
             int32_t T_prompt = 0;
-            if (codec_.encode(ref_audio.samples.data(), (int32_t)ref_audio.samples.size(),
+            if (init_encoder->encode(ref_audio.samples.data(), (int32_t)ref_audio.samples.size(),
                               params.gen.n_threads, ref_codes, T_prompt)) {
                 reference_embedding_ = std::string((const char*)ref_codes.data(),
                                                     ref_codes.size() * sizeof(int32_t));
@@ -120,7 +133,7 @@ bool Pipeline::init(const PipelineParams & params) {
         std::vector<float> zeros((size_t)codec_.sample_rate() * 3 / 4, 0.0f);
         std::vector<int32_t> codes;
         int32_t n_frames = 0;
-        if (codec_.encode(zeros.data(), (int32_t)zeros.size(),
+        if (init_encoder->encode(zeros.data(), (int32_t)zeros.size(),
                           params.gen.n_threads, codes, n_frames) &&
             n_frames >= 12 && !codes.empty()) {
             const int32_t num_cb = (int32_t)(codes.size() / n_frames);
@@ -144,9 +157,6 @@ bool Pipeline::init(const PipelineParams & params) {
                       << std::endl;
         }
     }
-
-    codec_on_gpu_ = (params.codec_vulkan_device != -1) &&
-                    (params.codec_vulkan_device >= 0 || params.vulkan_device >= 0);
 
     initialized_ = true;
     return true;
