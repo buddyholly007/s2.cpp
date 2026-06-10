@@ -1,4 +1,5 @@
 #include "../include/s2_generate.h"
+#include <chrono>
 #include <iostream>
 #include <limits>
 #include <algorithm>
@@ -49,10 +50,19 @@ GenerateResult generate(
     if (params.verbose) {
         std::cout << "[Generate] Prefilling " << prompt.cols << " tokens..." << std::endl;
     }
+    using clk = std::chrono::steady_clock;
+    auto ms_since = [](clk::time_point a, clk::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    auto t_pf0 = clk::now();
     if (!model.prefill(prompt_tm, prompt.cols, params.n_threads, state)) {
         std::cerr << "[Generate] Prefill failed." << std::endl;
         return out;
     }
+    const double ms_prefill = ms_since(t_pf0, clk::now());
+    // Per-stage accumulators for the AR loop profile
+    double ms_step = 0.0, ms_fast = 0.0, ms_sample = 0.0;
+    auto t_loop0 = clk::now();
 
     // Apply semantic mask to initial logits
     auto apply_mask_and_sample = [&](const std::vector<float> & logits,
@@ -167,6 +177,7 @@ GenerateResult generate(
 
         // Fast AR: generate remaining num_cb-1 codebooks
         // (seeded frames take all codebooks verbatim from the silence codes)
+        auto t_fa0 = clk::now();
         if (seeded) {
             for (int32_t cb_idx = 1; cb_idx < num_cb; ++cb_idx) {
                 codebooks_cb.push_back(
@@ -187,6 +198,8 @@ GenerateResult generate(
             codebooks_cb.push_back(cb_token);
         }
 
+        ms_fast += ms_since(t_fa0, clk::now());
+
         // Store frame: codes[cb * n_frames_capacity + step] = codebooks_cb[cb]
         for (int32_t cb = 0; cb < num_cb; ++cb) {
             out.codes[static_cast<size_t>(cb) * params.max_new_tokens + step] = codebooks_cb[cb];
@@ -200,10 +213,12 @@ GenerateResult generate(
             step_input[cb + 1] = codebooks_cb[cb];
         }
 
+        auto t_st0 = clk::now();
         if (!model.step(step_input, params.n_threads, state)) {
             std::cerr << "[Generate] step() failed at step " << step << std::endl;
             break;
         }
+        ms_step += ms_since(t_st0, clk::now());
 
         step++;
         if (params.verbose && step % 50 == 0) {
@@ -211,13 +226,26 @@ GenerateResult generate(
         }
 
         // Apply semantic mask and sample next main token
+        auto t_sm0 = clk::now();
         bool block_next_end = (step < params.min_tokens_before_end);
         main_token = apply_mask_and_sample(state.logits, block_next_end);
+        ms_sample += ms_since(t_sm0, clk::now());
     }
 
     if (params.verbose) {
+        const double ms_loop = ms_since(t_loop0, clk::now());
         std::cout << std::endl;
         std::cout << "[Generate] Done: " << out.n_frames << " frames generated." << std::endl;
+        if (out.n_frames > 0) {
+            const double f = out.n_frames;
+            std::cout << "[Timing] prefill " << (int)ms_prefill << "ms; loop "
+                      << (int)ms_loop << "ms for " << out.n_frames << " frames ("
+                      << (int)(f * 1000.0 / ms_loop) << " fps) — per frame: step "
+                      << ms_step / f << "ms, fastAR " << ms_fast / f
+                      << "ms, sample " << ms_sample / f << "ms, other "
+                      << (ms_loop - ms_step - ms_fast - ms_sample) / f << "ms"
+                      << std::endl;
+        }
     }
 
     // Compact codes from (num_cb, max_tokens) stride to (num_cb, n_frames) row-major

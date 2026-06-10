@@ -117,13 +117,15 @@ int main(int argc, char** argv) {
         for (int attempt = 1; attempt <= 60 && !warmed; ++attempt) {
             s2::PipelineParams warm = params;
             std::vector<char> discard;
-            // Single pass with the long text + the full generation budget:
-            // KV cache gets sized to its true ceiling (long prompt + max_new)
-            // and the prefill buffer to a worst-case prompt, so no real
-            // request ever needs to grow either one. A short-text warm-up
-            // undersizes the KV ceiling — the first long reply then regrows
-            // KV on a full card (observed 2026-06-09: seq_len 1269 vs 1239).
+            // Long text sizes the prefill buffer for a worst-case prompt, and
+            // kv_reserve_tokens sizes the KV cache to the full serving
+            // ceiling — while max_new_tokens=8 keeps actual generation (and
+            // the CPU codec decode) to ~8 frames. The old full-length warm-up
+            // generated ~860 frames and decoded ~40s of audio: ~5 minutes of
+            // boot for allocations that all happen before step 9 anyway.
             warm.text = worst_case_text;
+            warm.gen.kv_reserve_tokens = params.gen.max_new_tokens;
+            warm.gen.max_new_tokens = 8;
             bool ok = pipeline.synthesize_to_buffer(warm, discard);
             if (ok) {
                 warmed = true;

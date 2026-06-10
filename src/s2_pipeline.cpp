@@ -202,7 +202,7 @@ bool Pipeline::synthesize(const PipelineParams & params) {
         }
     }
 
-    int32_t max_seq_len = prompt.cols + gen.max_new_tokens;
+    int32_t max_seq_len = prompt.cols + std::max(gen.max_new_tokens, gen.kv_reserve_tokens);
 
     if (!kv_cache_initialized_ || max_seq_len > kv_cache_max_len_) {
         std::cout << "[INFO] Pipeline: init/reinit KV cache (max_seq_len="
@@ -326,7 +326,7 @@ bool Pipeline::synthesize_to_buffer(const PipelineParams & params, std::vector<c
         }
     }
 
-    int32_t max_seq_len = prompt.cols + gen.max_new_tokens;
+    int32_t max_seq_len = prompt.cols + std::max(gen.max_new_tokens, gen.kv_reserve_tokens);
     if (!kv_cache_initialized_ || max_seq_len > kv_cache_max_len_) {
         std::cout << "[INFO] Re-init KV cache for seq_len=" << max_seq_len << std::endl;
         if (model_.init_kv_cache(max_seq_len)) {
