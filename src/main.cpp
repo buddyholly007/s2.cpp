@@ -117,12 +117,14 @@ int main(int argc, char** argv) {
         for (int attempt = 1; attempt <= 60 && !warmed; ++attempt) {
             s2::PipelineParams warm = params;
             std::vector<char> discard;
-            // Long text sizes the prefill buffer for a worst-case prompt, and
-            // kv_reserve_tokens sizes the KV cache to the full serving
-            // ceiling — while max_new_tokens=8 keeps actual generation (and
-            // the CPU codec decode) to ~8 frames. The old full-length warm-up
-            // generated ~860 frames and decoded ~40s of audio: ~5 minutes of
-            // boot for allocations that all happen before step 9 anyway.
+            // Long text sizes the prefill buffer worst-case; kv_reserve_tokens
+            // sizes the KV cache to the serving ceiling while only 8 frames
+            // are actually generated/decoded (boot ~60s, not ~5min). The
+            // codec decode buffer no longer needs worst-case warm-up sizing:
+            // decode_chunked() bounds it to one fixed window (and on CPU the
+            // buffer is plain RAM anyway — GPU codec is blocked on upstream
+            // CUDA bugs: IM2COL invalid-argument + 590MB encode buffer,
+            // measured 2026-06-10).
             warm.text = worst_case_text;
             warm.gen.kv_reserve_tokens = params.gen.max_new_tokens;
             warm.gen.max_new_tokens = 8;

@@ -145,7 +145,70 @@ bool Pipeline::init(const PipelineParams & params) {
         }
     }
 
+    codec_on_gpu_ = (params.codec_vulkan_device != -1) &&
+                    (params.codec_vulkan_device >= 0 || params.vulkan_device >= 0);
+
     initialized_ = true;
+    return true;
+}
+
+// Chunked codec decode: bounds the decode compute buffer. A whole-clip GPU
+// decode of 512 frames needs a ~2.9GB CUDA buffer (measured 2026-06-10);
+// decoding fixed windows caps it at ~64 frames (~360MB) regardless of reply
+// length. Each window carries OVL frames of lead context so conv/attention
+// edges heal, and the splice is crossfaded over ~1 frame of samples.
+static bool decode_chunked(AudioCodec & codec,
+                           const int32_t * codes, int32_t n_frames,
+                           int32_t num_cb, int32_t n_threads,
+                           std::vector<float> & audio_out) {
+    // 24+8 frames/window ≈ 135MB decode buffer — sized to fit the ~776MB
+    // free-but-fragmented VRAM measured 2026-06-10 (48+8 wanted 271MB and
+    // still failed contiguous allocation on this card).
+    const int32_t CHUNK = 24;
+    const int32_t OVL   = 8;
+    if (num_cb <= 0 || n_frames <= 0) return false;
+    if (n_frames <= CHUNK + OVL) {
+        return codec.decode(codes, n_frames, n_threads, audio_out);
+    }
+    audio_out.clear();
+    std::vector<int32_t> win;
+    std::vector<float> win_audio;
+    int32_t spf = 0;  // samples per frame, learned from the first window
+    int32_t start = 0;
+    while (start < n_frames) {
+        const int32_t lead = (start == 0) ? 0 : OVL;
+        const int32_t core = std::min(CHUNK, n_frames - start);
+        const int32_t w0   = start - lead;
+        const int32_t wlen = lead + core;
+        win.resize((size_t)num_cb * wlen);
+        for (int32_t cb = 0; cb < num_cb; ++cb) {
+            for (int32_t t = 0; t < wlen; ++t) {
+                win[(size_t)cb * wlen + t] = codes[(size_t)cb * n_frames + w0 + t];
+            }
+        }
+        win_audio.clear();
+        if (!codec.decode(win.data(), wlen, n_threads, win_audio)) return false;
+        if (spf == 0) {
+            spf = (int32_t)(win_audio.size() / wlen);
+            if (spf <= 0) return false;
+        }
+        const size_t keep_begin = (size_t)lead * spf;
+        // Crossfade the previous window's tail into this window's rendering
+        // of the same time span (both have full decode context there).
+        const size_t xf = (start == 0)
+            ? 0
+            : std::min({(size_t)spf, audio_out.size(), keep_begin});
+        const size_t out_tail = audio_out.size() - xf;
+        for (size_t i = 0; i < xf; ++i) {
+            const float a = audio_out[out_tail + i];
+            const float b = win_audio[keep_begin - xf + i];
+            const float w = (float)(i + 1) / (float)(xf + 1);
+            audio_out[out_tail + i] = a * (1.0f - w) + b * w;
+        }
+        audio_out.insert(audio_out.end(),
+                         win_audio.begin() + keep_begin, win_audio.end());
+        start += core;
+    }
     return true;
 }
 
@@ -242,7 +305,12 @@ bool Pipeline::synthesize(const PipelineParams & params) {
 
     // 5. Decode
     std::vector<float> audio_out;
-    if (!codec_.decode(res.codes.data(), res.n_frames, params.gen.n_threads, audio_out)) {
+    const bool decode_ok = codec_on_gpu_
+        ? decode_chunked(codec_, res.codes.data(), res.n_frames,
+                         res.num_codebooks, params.gen.n_threads, audio_out)
+        : codec_.decode(res.codes.data(), res.n_frames,
+                        params.gen.n_threads, audio_out);
+    if (!decode_ok) {
         std::cerr << "Pipeline error: decode failed." << std::endl;
         return false;
     }
@@ -368,7 +436,12 @@ bool Pipeline::synthesize_to_buffer(const PipelineParams & params, std::vector<c
 
     // 5. Decode
     std::vector<float> audio_out;
-    if (!codec_.decode(res.codes.data(), res.n_frames, params.gen.n_threads, audio_out)) {
+    const bool decode_ok = codec_on_gpu_
+        ? decode_chunked(codec_, res.codes.data(), res.n_frames,
+                         res.num_codebooks, params.gen.n_threads, audio_out)
+        : codec_.decode(res.codes.data(), res.n_frames,
+                        params.gen.n_threads, audio_out);
+    if (!decode_ok) {
         std::cerr << "Pipeline error: decode failed." << std::endl;
         return false;
     }
