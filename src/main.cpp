@@ -5,6 +5,9 @@
 #include <string>
 #include <cstring>
 #include <cstdlib>
+#include <chrono>
+#include <mutex>
+#include <thread>
 
 int main(int argc, char** argv) {
     // --- Paramètres par défaut ---
@@ -93,6 +96,50 @@ int main(int argc, char** argv) {
         std::cout << "Leading prefix: disabled" << std::endl;
     }
 
+    // --- Warm-up: claim GPU compute buffers at startup, not at request time ---
+    // Pass 1 (short text, full max_new_tokens) sizes the KV cache for the
+    // longest allowed generation. Pass 2 (long text, 4 tokens) sizes the
+    // persistent prefill buffer for a worst-case prompt. Both allocations are
+    // retained for the process lifetime, so requests never cudaMalloc on a
+    // full card. Retries cover the boot race with TurboQuant's model load
+    // (After= orders process start, not VRAM allocation).
+    {
+        const std::string worst_case_text =
+            "Here is the complete list you asked for. First, the living room lights are at "
+            "forty percent and the kitchen lights are off. Second, the thermostat is holding "
+            "sixty-eight degrees with the fan on auto. Third, the front door is locked, the "
+            "garage door is closed, and the back door was opened twice this afternoon. Fourth, "
+            "the washer finished its cycle about twenty minutes ago and the dryer has eleven "
+            "minutes remaining. Fifth, the cameras saw the usual delivery around three thirty. "
+            "Sixth, tomorrow looks cloudy with a high of fifty-nine, so nothing unusual there. "
+            "Let me know if you want me to change any of these or hear anything again.";
+        bool warmed = false;
+        for (int attempt = 1; attempt <= 60 && !warmed; ++attempt) {
+            s2::PipelineParams warm = params;
+            std::vector<char> discard;
+            // Single pass with the long text + the full generation budget:
+            // KV cache gets sized to its true ceiling (long prompt + max_new)
+            // and the prefill buffer to a worst-case prompt, so no real
+            // request ever needs to grow either one. A short-text warm-up
+            // undersizes the KV ceiling — the first long reply then regrows
+            // KV on a full card (observed 2026-06-09: seq_len 1269 vs 1239).
+            warm.text = worst_case_text;
+            bool ok = pipeline.synthesize_to_buffer(warm, discard);
+            if (ok) {
+                warmed = true;
+                std::cout << "[warmup] GPU buffers reserved (attempt " << attempt << ")" << std::endl;
+            } else {
+                std::cerr << "[warmup] attempt " << attempt
+                          << " failed (GPU busy/full?); retrying in 5s" << std::endl;
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+            }
+        }
+        if (!warmed) {
+            std::cerr << "[warmup] giving up after 60 attempts — serving anyway; "
+                         "requests may fail to cloud fallback until VRAM frees" << std::endl;
+        }
+    }
+
     // --- Serveur HTTP ---
     crow::SimpleApp app;
 
@@ -100,6 +147,14 @@ int main(int argc, char** argv) {
     // Helper : traitement commun de synthèse
     // ================================================================
     auto do_synthesize = [&](const crow::json::rvalue& json) -> crow::response {
+        // Crow dispatches handlers on 8 threads but Pipeline/SlowARModel share
+        // one KV cache, n_past_, and the allocr swap in prefill() — concurrent
+        // synthesis corrupts state. Serialize: the GPU AR loop is serial
+        // anyway, so queueing costs latency only (e.g. probe overlapping a
+        // real request).
+        static std::mutex synth_mutex;
+        std::lock_guard<std::mutex> synth_lock(synth_mutex);
+
         s2::PipelineParams synth_params = params;
 
         // Compatibilité Fish Audio : "text" est le champ principal
@@ -116,7 +171,15 @@ int main(int argc, char** argv) {
         // prepend a throwaway interjection that the model will discard, so the
         // caller's actual first word survives. Skip if the caller already starts
         // with the same prefix to avoid double-prepending.
-        if (!leading_prefix.empty() && !synth_params.text.empty() &&
+        // 2026-06-09: live evidence the prefix is audibly spoken (Sean asked
+        // Peter why he always says "Listen") — per-request opt-out below lets
+        // A/B testing settle whether the mangling claim still holds without
+        // env churn + service restarts. {"leading_prefix": false} disables.
+        bool want_prefix = true;
+        if (json.has("leading_prefix")) {
+            want_prefix = json["leading_prefix"].b();
+        }
+        if (want_prefix && !leading_prefix.empty() && !synth_params.text.empty() &&
             synth_params.text.compare(0, leading_prefix.size(), leading_prefix) != 0) {
             synth_params.text = leading_prefix + synth_params.text;
         }

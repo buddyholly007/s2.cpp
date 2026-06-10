@@ -138,6 +138,10 @@ private:
     ggml_backend_sched_t sched_  = nullptr;
     ggml_gallocr_t allocr_       = nullptr;
     ggml_gallocr_t fast_allocr_  = nullptr;
+    // Persistent prefill allocr: claimed once (startup warm-up) and retained.
+    // Freeing it per-request meant re-allocating ~165MB from a full GPU at
+    // request time — the 2026-06 OOM that silently pushed all TTS to cloud.
+    ggml_gallocr_t prefill_allocr_ = nullptr;
     ggml_context * ctx_kv_      = nullptr;
     ggml_backend_buffer_t kv_buf_ = nullptr;
     ggml_tensor *  memory_k_   = nullptr;

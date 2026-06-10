@@ -99,10 +99,31 @@ GenerateResult generate(
         std::cout << "[Generate] Generating (max " << params.max_new_tokens << " tokens)..." << std::endl;
     }
 
+    const int32_t n_seed = params.seed_frames.empty()
+        ? 0
+        : (int32_t)(params.seed_frames.size() / num_cb);
+    if (params.verbose && n_seed > 0) {
+        std::cout << "[Generate] Silence runway: seeding " << n_seed
+                  << " frames; semantic codes:";
+        for (int32_t t = 0; t < n_seed; ++t) {
+            std::cout << " " << params.seed_frames[(size_t)t * num_cb];
+        }
+        std::cout << std::endl;
+    }
+
     int32_t step = 0;
     while (main_token != im_end_id && step < params.max_new_tokens) {
+        // Silence runway: force the first n_seed frames from known-silence
+        // codes instead of the sampled token, so the utterance opens from
+        // quiet and the first phoneme survives. The sampled token (and RAS)
+        // resume at step == n_seed with the KV state conditioned on silence.
+        const bool seeded = step < n_seed;
+        if (seeded) {
+            main_token = params.seed_frames[(size_t)step * num_cb] + sem_begin;
+        }
+
         // RAS check
-        if (!ras_window.empty() &&
+        if (!seeded && !ras_window.empty() &&
             std::find(ras_window.begin(), ras_window.end(), main_token) != ras_window.end() &&
             main_token >= sem_begin && main_token <= sem_end)
         {
@@ -122,10 +143,15 @@ GenerateResult generate(
             main_token = sample_token(biased.data(), vocab_size, ras_sparams, ras_force_id);
         }
 
-        // Update RAS window
-        ras_window.push_back(main_token);
-        if ((int32_t)ras_window.size() > ras_window_size) {
-            ras_window.erase(ras_window.begin());
+        // Update RAS window (seeded silence frames stay out of it — they are
+        // intentional repeats, and counting them would trigger a high-temp
+        // RAS resample on the first naturally-sampled frame after the runway,
+        // right at the onset we are protecting)
+        if (!seeded) {
+            ras_window.push_back(main_token);
+            if ((int32_t)ras_window.size() > ras_window_size) {
+                ras_window.erase(ras_window.begin());
+            }
         }
 
         // sem_code: convert from vocabulary space to codebook space
@@ -140,6 +166,13 @@ GenerateResult generate(
         codebooks_cb.push_back(sem_code);
 
         // Fast AR: generate remaining num_cb-1 codebooks
+        // (seeded frames take all codebooks verbatim from the silence codes)
+        if (seeded) {
+            for (int32_t cb_idx = 1; cb_idx < num_cb; ++cb_idx) {
+                codebooks_cb.push_back(
+                    params.seed_frames[(size_t)step * num_cb + cb_idx]);
+            }
+        } else
         for (int32_t cb_idx = 1; cb_idx < num_cb; ++cb_idx) {
             // prefix = codebooks_cb[0..cb_idx-1]
             if (!model.fast_decode(state.hidden, codebooks_cb, params.n_threads, fast_logits)) {

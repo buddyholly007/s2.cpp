@@ -58,6 +58,12 @@ private:
     bool reference_loaded_ = false;
     std::string reference_embedding_;
     std::string reference_text_;
+
+    // Canonical silence VQ codes for the generation runway: produced at init
+    // by encoding digital silence and keeping middle frames (encoder edge
+    // windows excluded). Layout (num_codebooks, T) row-major like encode().
+    std::vector<int32_t> silence_codes_;
+    int32_t silence_frames_ = 0;
 };
 
 } // namespace s2

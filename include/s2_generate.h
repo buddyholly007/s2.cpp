@@ -23,6 +23,12 @@ struct GenerateParams {
     int32_t min_tokens_before_end   = 64;
     int32_t n_threads               = 4;
     bool    verbose                 = true;
+    // Silence runway: frames forced as the first generation outputs instead
+    // of sampling, frame-major (t * num_codebooks + cb), codebook-space.
+    // Filled by the pipeline from the padded reference head (known silence)
+    // so the first phoneme never lands on frame zero — the Peter checkpoint
+    // otherwise clips weak onsets (/h/) stochastically. Empty = disabled.
+    std::vector<int32_t> seed_frames;
 };
 
 // Generate VQ codes autoregressively.

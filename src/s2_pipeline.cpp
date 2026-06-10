@@ -112,6 +112,39 @@ bool Pipeline::init(const PipelineParams & params) {
         std::cout << "Reference text loaded." << std::endl;
     }
 
+    // --- Canonical silence codes for the generation runway ---
+    // Encode 750ms of digital silence and keep middle frames (encoder edge
+    // windows excluded). These are ground-truth "silence" in VQ space,
+    // independent of how tightly the reference clip was cut.
+    {
+        std::vector<float> zeros((size_t)codec_.sample_rate() * 3 / 4, 0.0f);
+        std::vector<int32_t> codes;
+        int32_t n_frames = 0;
+        if (codec_.encode(zeros.data(), (int32_t)zeros.size(),
+                          params.gen.n_threads, codes, n_frames) &&
+            n_frames >= 12 && !codes.empty()) {
+            const int32_t num_cb = (int32_t)(codes.size() / n_frames);
+            const int32_t keep = 8, start = (n_frames - keep) / 2;
+            silence_codes_.resize((size_t)num_cb * keep);
+            for (int32_t cb = 0; cb < num_cb; ++cb) {
+                for (int32_t t = 0; t < keep; ++t) {
+                    silence_codes_[(size_t)cb * keep + t] =
+                        codes[(size_t)cb * n_frames + start + t];
+                }
+            }
+            silence_frames_ = keep;
+            std::cout << "[init] Silence codes ready (" << keep
+                      << " frames); semantic row:";
+            for (int32_t t = 0; t < keep; ++t) {
+                std::cout << " " << silence_codes_[t];
+            }
+            std::cout << std::endl;
+        } else {
+            std::cout << "[init] Silence-code encoding unavailable; runway disabled."
+                      << std::endl;
+        }
+    }
+
     initialized_ = true;
     return true;
 }
@@ -152,30 +185,56 @@ bool Pipeline::synthesize(const PipelineParams & params) {
     // Dans synthesize_to_buffer() - APRÈS la construction du prompt (~ligne 150-170)
 
     // 3. Setup KV Cache - FIX SERVEUR (ne plus appeler init_kv_cache() à chaque fois)
-    int32_t max_seq_len = prompt.cols + params.gen.max_new_tokens;
+    GenerateParams gen = params.gen;
+
+    // Silence runway: force canonical silence codes (encoded from digital
+    // silence at init — see silence_codes_) as the opening of every
+    // generation, so the first phoneme never lands on frame zero.
+    const int32_t SEED_N = 6;
+    if (silence_frames_ >= SEED_N &&
+        silence_codes_.size() == (size_t)num_codebooks * silence_frames_) {
+        gen.seed_frames.resize((size_t)SEED_N * num_codebooks);
+        for (int32_t t = 0; t < SEED_N; ++t) {
+            for (int32_t cb = 0; cb < num_codebooks; ++cb) {
+                gen.seed_frames[(size_t)t * num_codebooks + cb] =
+                    silence_codes_[(size_t)cb * silence_frames_ + t];
+            }
+        }
+    }
+
+    int32_t max_seq_len = prompt.cols + gen.max_new_tokens;
 
     if (!kv_cache_initialized_ || max_seq_len > kv_cache_max_len_) {
-        std::cout << "[INFO] Pipeline: init/reinit KV cache (max_seq_len=" 
+        std::cout << "[INFO] Pipeline: init/reinit KV cache (max_seq_len="
                   << max_seq_len << ", prev=" << kv_cache_max_len_ << ")" << std::endl;
-        
-        if (!model_.init_kv_cache(max_seq_len)) {
+
+        if (model_.init_kv_cache(max_seq_len)) {
+            kv_cache_initialized_ = true;
+            kv_cache_max_len_ = max_seq_len;
+        } else if (kv_cache_initialized_ && prompt.cols + 32 <= kv_cache_max_len_) {
+            // Growing the cache needs a fresh GPU allocation that can fail on
+            // a full card (init_kv_cache leaves the old cache intact on
+            // failure). Degrade instead of failing: clamp the generation
+            // budget to the existing cache — shorter audio beats an HTTP 500
+            // and a silent cloud fallback.
+            gen.max_new_tokens = kv_cache_max_len_ - prompt.cols;
+            std::cerr << "[WARN] Pipeline: KV regrow failed; clamping max_new_tokens to "
+                      << gen.max_new_tokens << " (cache max=" << kv_cache_max_len_ << ")" << std::endl;
+        } else {
             std::cerr << "Pipeline error: init_kv_cache failed." << std::endl;
             return false;
         }
-        
-        kv_cache_initialized_ = true;
-        kv_cache_max_len_ = max_seq_len;
-        
+
         // Reset position dans le cache pour nouvelle génération
         model_.reset();
-        
+
     } else {
         std::cout << "[INFO] Pipeline: reusing KV cache (max=" << kv_cache_max_len_ << ")" << std::endl;
         model_.reset();  // Reset n_past_ = 0 pour nouvelle génération
     }
 
     // 4. Generate
-    GenerateResult res = generate(model_, tokenizer_.config(), prompt, params.gen);
+    GenerateResult res = generate(model_, tokenizer_.config(), prompt, gen);
     if (res.n_frames == 0) {
         std::cerr << "Pipeline error: generation produced no frames." << std::endl;
         return false;
@@ -251,15 +310,40 @@ bool Pipeline::synthesize_to_buffer(const PipelineParams & params, std::vector<c
               << " ms" << std::endl;
 
     // 3. Setup KV Cache - CORRIGÉ
-    int32_t max_seq_len = prompt.cols + params.gen.max_new_tokens;
+    GenerateParams gen = params.gen;
+
+    // Silence runway (same as synthesize() above): force canonical silence
+    // codes from init as the opening of every generation.
+    const int32_t SEED_N = 6;
+    if (silence_frames_ >= SEED_N &&
+        silence_codes_.size() == (size_t)num_codebooks * silence_frames_) {
+        gen.seed_frames.resize((size_t)SEED_N * num_codebooks);
+        for (int32_t t = 0; t < SEED_N; ++t) {
+            for (int32_t cb = 0; cb < num_codebooks; ++cb) {
+                gen.seed_frames[(size_t)t * num_codebooks + cb] =
+                    silence_codes_[(size_t)cb * silence_frames_ + t];
+            }
+        }
+    }
+
+    int32_t max_seq_len = prompt.cols + gen.max_new_tokens;
     if (!kv_cache_initialized_ || max_seq_len > kv_cache_max_len_) {
         std::cout << "[INFO] Re-init KV cache for seq_len=" << max_seq_len << std::endl;
-        if (!model_.init_kv_cache(max_seq_len)) {
+        if (model_.init_kv_cache(max_seq_len)) {
+            kv_cache_initialized_ = true;
+            kv_cache_max_len_ = max_seq_len;
+        } else if (kv_cache_initialized_ && prompt.cols + 32 <= kv_cache_max_len_) {
+            // Failed grow leaves the old cache intact (transactional
+            // init_kv_cache) — clamp the generation budget and continue
+            // rather than 500ing into a silent cloud fallback.
+            gen.max_new_tokens = kv_cache_max_len_ - prompt.cols;
+            std::cerr << "[WARN] Pipeline: KV regrow failed; clamping max_new_tokens to "
+                      << gen.max_new_tokens << " (cache max=" << kv_cache_max_len_ << ")" << std::endl;
+        } else {
             std::cerr << "Pipeline error: init_kv_cache failed." << std::endl;
             return false;
         }
-        kv_cache_initialized_ = true;
-        kv_cache_max_len_ = max_seq_len;
+        model_.reset();
     } else {
         std::cout << "[INFO] Reusing KV cache (max_len=" << kv_cache_max_len_ << ")" << std::endl;
     model_.reset();
@@ -271,7 +355,7 @@ bool Pipeline::synthesize_to_buffer(const PipelineParams & params, std::vector<c
               << " ms" << std::endl;
 
     // 4. Generate
-    GenerateResult res = generate(model_, tokenizer_.config(), prompt, params.gen);
+    GenerateResult res = generate(model_, tokenizer_.config(), prompt, gen);
     if (res.n_frames == 0) {
         std::cerr << "Pipeline error: generation produced no frames." << std::endl;
         return false;

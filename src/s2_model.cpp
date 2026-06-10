@@ -95,6 +95,7 @@ SlowARModel::~SlowARModel() {
     if (weights_.cpu_emb_buf) ggml_backend_buffer_free(weights_.cpu_emb_buf);
     if (weights_.ctx_w)   ggml_free(weights_.ctx_w);
     if (weights_.model_buf) ggml_backend_buffer_free(weights_.model_buf);
+    if (prefill_allocr_)  ggml_gallocr_free(prefill_allocr_);
     if (fast_allocr_)     ggml_gallocr_free(fast_allocr_);
     if (allocr_)          ggml_gallocr_free(allocr_);
     if (cpu_backend_ && cpu_backend_ != backend_) ggml_backend_free(cpu_backend_);
@@ -131,8 +132,9 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
         return false;
     }
 
-    allocr_      = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
-    fast_allocr_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
+    allocr_         = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
+    fast_allocr_    = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
+    prefill_allocr_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
 
     struct gguf_init_params params = { /*no_alloc=*/true, /*ctx=*/&weights_.ctx_w };
     gguf_context * ctx_gguf = gguf_init_from_file(gguf_path.c_str(), params);
@@ -435,11 +437,20 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
 // ---------------------------------------------------------------------------
 
 bool SlowARModel::init_kv_cache(int32_t max_seq_len) {
-    max_seq_len_ = max_seq_len;
-    n_past_      = 0;
-
+    // Transactional: build the new cache in locals and swap in only on
+    // success. A failed GROW must leave the existing cache fully usable
+    // (the pipeline clamps max_new_tokens and continues on it). The old
+    // code had three state bugs here: it updated max_seq_len_ before
+    // allocating (failed grow -> eval thinks capacity is bigger than the
+    // real buffer -> OOB), it overwrote ctx_kv_/memory_k_/v_ before the
+    // alloc (failed grow -> dangling tensors), and it never freed the old
+    // buffer on success (every grow leaked the previous KV cache on GPU).
     const int32_t dim = hparams_.embedding_length;
-    if (dim == 0) return true;
+    if (dim == 0) {
+        max_seq_len_ = max_seq_len;
+        n_past_      = 0;
+        return true;
+    }
 
     // head_dim: if attention_qk_norm, get from q_norm weight shape; else dim/head_count
     int32_t head_dim = 0;
@@ -458,23 +469,33 @@ bool SlowARModel::init_kv_cache(int32_t max_seq_len) {
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc =*/ true,
     };
-    ctx_kv_ = ggml_init(p);
-    if (!ctx_kv_) {
+    ggml_context * new_ctx = ggml_init(p);
+    if (!new_ctx) {
         std::cerr << "[Model] Failed to init KV context." << std::endl;
         return false;
     }
 
-    memory_k_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F16, head_dim, n_head_kv, max_seq_len, n_layer);
-    memory_v_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F16, head_dim, n_head_kv, max_seq_len, n_layer);
+    ggml_tensor * new_k = ggml_new_tensor_4d(new_ctx, GGML_TYPE_F16, head_dim, n_head_kv, max_seq_len, n_layer);
+    ggml_tensor * new_v = ggml_new_tensor_4d(new_ctx, GGML_TYPE_F16, head_dim, n_head_kv, max_seq_len, n_layer);
 
-    kv_buf_ = ggml_backend_alloc_ctx_tensors(ctx_kv_, backend_);
-    if (!kv_buf_) {
+    ggml_backend_buffer_t new_buf = ggml_backend_alloc_ctx_tensors(new_ctx, backend_);
+    if (!new_buf) {
         std::cerr << "[Model] Failed to allocate KV cache buffer." << std::endl;
-        return false;
+        ggml_free(new_ctx);
+        return false;  // existing cache (if any) is untouched and still valid
     }
 
-    ggml_backend_tensor_memset(memory_k_, 0, 0, ggml_nbytes(memory_k_));
-    ggml_backend_tensor_memset(memory_v_, 0, 0, ggml_nbytes(memory_v_));
+    ggml_backend_tensor_memset(new_k, 0, 0, ggml_nbytes(new_k));
+    ggml_backend_tensor_memset(new_v, 0, 0, ggml_nbytes(new_v));
+
+    if (kv_buf_) ggml_backend_buffer_free(kv_buf_);
+    if (ctx_kv_) ggml_free(ctx_kv_);
+    ctx_kv_      = new_ctx;
+    kv_buf_      = new_buf;
+    memory_k_    = new_k;
+    memory_v_    = new_v;
+    max_seq_len_ = max_seq_len;
+    n_past_      = 0;
 
     return true;
 }
@@ -494,14 +515,14 @@ void SlowARModel::reset() {
 
 bool SlowARModel::prefill(const std::vector<int32_t> & flat_tokens, int32_t n_tokens,
                           int32_t n_threads, StepResult & result) {
-    // Use a temporary gallocr for prefill so the large compute buffer
-    // (sized for n_tokens) is freed immediately after, not kept for steps.
-    ggml_gallocr_t prefill_allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
-    if (!prefill_allocr) return false;
-    std::swap(allocr_, prefill_allocr);
+    // Persistent prefill allocr (claimed by the startup warm-up, retained for
+    // the process lifetime). The buffer only grows if a larger prefill graph
+    // arrives; it is never freed between requests — re-allocating from a full
+    // GPU at request time is exactly the OOM this replaces.
+    if (!prefill_allocr_) return false;
+    std::swap(allocr_, prefill_allocr_);
     bool ok = eval_cached(flat_tokens, n_tokens, n_threads, result);
-    std::swap(allocr_, prefill_allocr);
-    ggml_gallocr_free(prefill_allocr);
+    std::swap(allocr_, prefill_allocr_);
     return ok;
 }
 
