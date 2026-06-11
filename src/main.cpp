@@ -127,12 +127,13 @@ int main(int argc, char** argv) {
             // measured 2026-06-10).
             warm.text = worst_case_text;
             warm.gen.kv_reserve_tokens = params.gen.max_new_tokens;
-            // 40 > decode_chunked's window (CHUNK 24 + OVL 8): the warm-up
-            // decode must span at least one FULL window so the GPU decode
-            // buffer reserves at its real size — an 8-frame warm-up left the
-            // first real request to allocate ~142MB on a full card (failed,
-            // measured 2026-06-10).
-            warm.gen.max_new_tokens = 40;
+            // 64 ≥ CHUNK+OVL+CHUNK (24+8+24): the warm-up decode must produce
+            // at least one MIDDLE window (lead 8 + core 24 = 32 frames) so the
+            // GPU decode buffer reserves at its true worst-case size. 40 was
+            // not enough — its largest window was 24 frames, and the first
+            // real 64-frame reply then re-reserved ~190MB at request time on
+            // a full card (failed, measured 2026-06-11).
+            warm.gen.max_new_tokens = 64;
             bool ok = pipeline.synthesize_to_buffer(warm, discard);
             if (ok) {
                 warmed = true;

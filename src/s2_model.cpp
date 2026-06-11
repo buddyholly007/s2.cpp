@@ -516,12 +516,27 @@ void SlowARModel::reset() {
 bool SlowARModel::prefill(const std::vector<int32_t> & flat_tokens, int32_t n_tokens,
                           int32_t n_threads, StepResult & result) {
     // Persistent prefill allocr (claimed by the startup warm-up, retained for
-    // the process lifetime). The buffer only grows if a larger prefill graph
-    // arrives; it is never freed between requests — re-allocating from a full
-    // GPU at request time is exactly the OOM this replaces.
+    // the process lifetime) + CHUNKED evaluation: the compute buffer scales
+    // with the largest chunk, never the whole prompt, so an arbitrarily long
+    // prompt can no longer demand a fresh request-time allocation on a full
+    // card (the residual OOM class that remained after warm-up reservation).
+    // eval_cached advances n_past_ per call, so chunks append to the same KV
+    // sequence; the last chunk's logits/hidden are the prefill result.
+    const int32_t CHUNK = 128;
     if (!prefill_allocr_) return false;
+    if (n_tokens <= 0) return false;
+    const int32_t stride = (int32_t)(flat_tokens.size() / (size_t)n_tokens); // num_cb + 1
     std::swap(allocr_, prefill_allocr_);
-    bool ok = eval_cached(flat_tokens, n_tokens, n_threads, result);
+    bool ok = true;
+    int32_t done = 0;
+    while (done < n_tokens && ok) {
+        const int32_t n = std::min(CHUNK, n_tokens - done);
+        const std::vector<int32_t> batch(
+            flat_tokens.begin() + (size_t)done * stride,
+            flat_tokens.begin() + (size_t)(done + n) * stride);
+        ok = eval_cached(batch, n, n_threads, result);
+        done += n;
+    }
     std::swap(allocr_, prefill_allocr_);
     return ok;
 }
