@@ -365,13 +365,13 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
     std::cout << "[Model] Weights loaded. Total tensors: " << n_tensors << std::endl;
 
     // Create CPU copies of all embedding tensors used by get_rows.
-    // CUDA's get_rows kernel rejects several quantized types (Q4_K among them),
-    // so when the model backend is CUDA we shadow each quantized embedding tensor
-    // on the CPU and feed lookup results into the graph as plain F32 inputs.
+    // CUDA's get_rows path is fragile here, and eval_cached always consumes the
+    // host-precomputed main embedding input. Mirror F16 as well as quantized
+    // tensors so f16 models do not feed zeroed embeddings into the graph.
     // Covers: main embeddings, codebook embeddings (slow AR), fast embeddings (fast AR).
     if (!ggml_backend_is_cpu(backend_)) {
         auto needs_cpu_copy = [](ggml_tensor * t) {
-            return t && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_F32;
+            return t && t->type != GGML_TYPE_F32;
         };
 
         const bool need_main     = needs_cpu_copy(weights_.embeddings);
@@ -400,7 +400,7 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
                 (need_main     ? ggml_nbytes(weights_.embeddings)          : 0) / 1048576 +
                 (need_codebook ? ggml_nbytes(weights_.codebook_embeddings) : 0) / 1048576 +
                 (need_fast     ? ggml_nbytes(weights_.fast_embeddings)     : 0) / 1048576;
-            std::cerr << "[Model] Mirroring quantized embeddings on CPU ("
+            std::cerr << "[Model] Mirroring embeddings on CPU ("
                       << total_mb << " MB across "
                       << (need_main + need_codebook + need_fast) << " tensors)..." << std::endl;
 

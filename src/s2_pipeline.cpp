@@ -290,7 +290,7 @@ bool Pipeline::synthesize(const PipelineParams & params) {
             // failure). Degrade instead of failing: clamp the generation
             // budget to the existing cache — shorter audio beats an HTTP 500
             // and a silent cloud fallback.
-            gen.max_new_tokens = kv_cache_max_len_ - prompt.cols;
+            gen.max_new_tokens = std::min(gen.max_new_tokens, kv_cache_max_len_ - prompt.cols);
             std::cerr << "[WARN] Pipeline: KV regrow failed; clamping max_new_tokens to "
                       << gen.max_new_tokens << " (cache max=" << kv_cache_max_len_ << ")" << std::endl;
         } else {
@@ -414,7 +414,7 @@ bool Pipeline::synthesize_to_buffer(const PipelineParams & params, std::vector<c
             // Failed grow leaves the old cache intact (transactional
             // init_kv_cache) — clamp the generation budget and continue
             // rather than 500ing into a silent cloud fallback.
-            gen.max_new_tokens = kv_cache_max_len_ - prompt.cols;
+            gen.max_new_tokens = std::min(gen.max_new_tokens, kv_cache_max_len_ - prompt.cols);
             std::cerr << "[WARN] Pipeline: KV regrow failed; clamping max_new_tokens to "
                       << gen.max_new_tokens << " (cache max=" << kv_cache_max_len_ << ")" << std::endl;
         } else {
