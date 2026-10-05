@@ -8,6 +8,8 @@
 #include <chrono>
 #include <mutex>
 #include <thread>
+#include <algorithm>
+#include <limits>
 
 int main(int argc, char** argv) {
     // --- Paramètres par défaut ---
@@ -199,6 +201,26 @@ int main(int argc, char** argv) {
         if (json.has("top_p"))       synth_params.gen.top_p = json["top_p"].d();
         if (json.has("top_k"))       synth_params.gen.top_k = json["top_k"].i();
         if (json.has("threads"))     synth_params.gen.n_threads = json["threads"].i();
+        // A caller may bound a short synthesis without changing the resident
+        // service's maximum or the warmed KV-cache reservation.
+        if (json.has("max_tokens")) {
+            try {
+                if (json["max_tokens"].t() != crow::json::type::Number ||
+                    (json["max_tokens"].nt() != crow::json::num_type::Signed_integer &&
+                     json["max_tokens"].nt() != crow::json::num_type::Unsigned_integer) ||
+                    json["max_tokens"].d() > std::numeric_limits<int32_t>::max()) {
+                    return crow::response(400, "max_tokens must be a positive 32-bit integer");
+                }
+                const auto requested_tokens = json["max_tokens"].i();
+                if (requested_tokens <= 0) {
+                    return crow::response(400, "max_tokens must be a positive 32-bit integer");
+                }
+                synth_params.gen.max_new_tokens = std::min<int64_t>(
+                    requested_tokens, params.gen.max_new_tokens);
+            } catch (const std::exception&) {
+                return crow::response(400, "max_tokens must be a positive 32-bit integer");
+            }
+        }
 
         // Paramètres Fish Audio (ignorés gracieusement si non pertinents)
         // reference_id, chunk_length, normalize, format, mp3_bitrate, opus_bitrate, latency
